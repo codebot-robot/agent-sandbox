@@ -1,0 +1,17 @@
+F   UID     PID    PPID PRI  NI    VSZ   RSS WCHAN  STAT TTY        TIME COMMAND
+4     0       1       0  20   0 1273756 37692 futex_ Ssl ?          0:00 /opt/repo-agent/repo-sandbox dev-daemon
+4     0      21       1  20   0 1115928 64880 do_epo Sl  ?          0:00 /usr/lib/code-server/lib/node /usr/lib/code-server --auth=none --bind-addr=0.0.0.0:13337 /workspaces/agent-sandbox
+4     0      40      21  20   0 1051020 65800 do_epo Sl  ?          0:00 /usr/lib/code-server/lib/node /usr/lib/code-server/out/node/entry
+0     0      53       1  20   0 1272084 33688 futex_ Sl  ?          0:00 /opt/repo-agent/repo-sandbox chore --in-pod=true
+4     0      62      53  20   0   4208  3388 do_wai S    ?          0:00 /bin/bash /workspaces/.agent/tasks/chore-agent-sandbox-review-prs-1773985851-chore/pre-script.sh
+4     0     195      62  20   0 22399412 200488 do_epo Sl ?         0:07 node --no-warnings=DEP0040 /usr/local/bin/gemini --yolo
+4     0     218     195  20   0 43540856 324468 do_epo Sl ?         0:14 /usr/bin/node --no-warnings=DEP0040 /usr/local/bin/gemini --yolo
+4     0     381       0  20   0   2684  1864 do_wai Ss   ?          0:00 sh -c export SSHD_ROOT_DIR="/tmp/ssh" && /opt/repo-agent/repo-sandbox sshd
+0     0     387     381  20   0 1272604 31424 futex_ Sl  ?          0:00 /opt/repo-agent/repo-sandbox sshd
+4     0     396     387  20   0   4336  3824 do_wai Ss   pts/0      0:00 /bin/bash
+0     0    4588     218  20   0   4076  3240 do_wai Ss+  pts/1      0:00 bash -c shopt -u promptvars nullglob extglob nocaseglob dotglob; { make lint-go; }; __code=$?; pgrep -g 0 >/workspaces/.tmp/shell_pgrep_34b09cae3221.tmp 2>&1; exit $__code;
+0     0    4590    4588  20   0   2968  2292 do_wai S+   pts/1      0:00 make lint-go
+0     0    4591    4590  20   0  17332 11648 do_wai S+   pts/1      0:00 python3 ./dev/tools/lint-go
+0     0    4592    4591  20   0 1343124 65500 futex_ Sl+ pts/1      0:19 go tool -modfile=/workspaces/agent-sandbox/dev/tools/go.mod golangci-lint run --config=/workspaces/agent-sandbox/dev/tools/.golangci.yaml
+4     0    9640    4592  20   0 2588200 534716 -    Rl+  pts/1      0:17 /workspaces/.tmp/go-build1106866596/b001/exe/golangci-lint run --config=/workspaces/agent-sandbox/dev/tools/.golangci.yaml
+0     0   14160     396  20   0   6432  3684 -      R+   pts/0      0:00 ps lax
