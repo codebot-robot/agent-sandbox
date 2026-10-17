@@ -51,6 +51,6 @@ USER 1000
 # Document the default pod-network ports: REST (:8080) and gRPC (:9090).
 # The interface and ports are configurable with --listen-host, --rest-port,
 # and --grpc-port.
-EXPOSE 8080 9090
+EXPOSE 8080 9090 8081
 
 ENTRYPOINT ["/usr/local/bin/sandboxd"]

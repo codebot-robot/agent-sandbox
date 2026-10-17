@@ -29,6 +29,8 @@ package main
 
 import (
 	"context"
+	"crypto/tls"
+	"crypto/x509"
 	"errors"
 	"flag"
 	"fmt"
@@ -43,6 +45,7 @@ import (
 	"github.com/go-logr/logr"
 	"golang.org/x/sync/errgroup"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/reflection"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
@@ -76,6 +79,7 @@ type config struct {
 	listenHost        string
 	grpcPort          int
 	restPort          int
+	healthPort        int
 	rootDir           string
 	metadataEnvPrefix string
 	shutdownTimeout   time.Duration
@@ -83,6 +87,10 @@ type config struct {
 	streamChunkSize   int
 	authTokenSHA256   string
 	authTokenFile     string
+	tlsCertFile       string
+	tlsKeyFile        string
+	tlsClientCAFile   string
+	requireClientCert bool
 	printVersion      bool
 }
 
@@ -96,6 +104,8 @@ func main() {
 		"Port for the gRPC ProcessService.")
 	flag.IntVar(&cfg.restPort, "rest-port", 8080,
 		"Port for the Filesystem & Runtime REST API.")
+	flag.IntVar(&cfg.healthPort, "health-port", 0,
+		"Optional port to serve plaintext HTTP GET /v1/health for kubelet readiness probes (0 disables separate health listener).")
 	flag.StringVar(&cfg.rootDir, "root-dir", "/workspace",
 		"Sandbox root directory that file operations and working directories are confined to. Created if missing.")
 	flag.StringVar(&cfg.metadataEnvPrefix, "metadata-env-prefix", "SANDBOX_",
@@ -110,6 +120,14 @@ func main() {
 		"Hex SHA-256 digest of a bearer token required on every gRPC call and REST request except GET /v1/health. The token itself never reaches the daemon. Mutually exclusive with --auth-token-file; both empty disables authentication.")
 	flag.StringVar(&cfg.authTokenFile, "auth-token-file", "",
 		"File holding a bearer token (e.g. a mounted Secret), required like --auth-token-sha256. Mutually exclusive with it.")
+	flag.StringVar(&cfg.tlsCertFile, "tls-cert-file", "",
+		"Path to the certificate file for serving TLS on gRPC and REST.")
+	flag.StringVar(&cfg.tlsKeyFile, "tls-key-file", "",
+		"Path to the private key file for serving TLS on gRPC and REST.")
+	flag.StringVar(&cfg.tlsClientCAFile, "tls-client-ca-file", "",
+		"Path to the CA bundle used to verify client certificates.")
+	flag.BoolVar(&cfg.requireClientCert, "require-client-cert", false,
+		"Require and verify client certificates on gRPC and REST connections (mutual TLS).")
 	flag.BoolVar(&cfg.printVersion, "version", false, "Print version information and exit.")
 	zapOpts.BindFlags(flag.CommandLine)
 	flag.Parse()
@@ -151,6 +169,53 @@ func authTokenDigest(cfg *config) ([]byte, error) {
 	return nil, nil
 }
 
+// buildTLSConfig validates TLS flags and constructs the server tls.Config.
+func buildTLSConfig(cfg *config) (*tls.Config, error) {
+	if cfg.tlsCertFile == "" && cfg.tlsKeyFile == "" {
+		if cfg.requireClientCert {
+			return nil, errors.New("--require-client-cert requires --tls-cert-file and --tls-key-file")
+		}
+		if cfg.tlsClientCAFile != "" {
+			return nil, errors.New("--tls-client-ca-file requires --tls-cert-file and --tls-key-file")
+		}
+		return nil, nil
+	}
+	if cfg.tlsCertFile == "" || cfg.tlsKeyFile == "" {
+		return nil, errors.New("--tls-cert-file and --tls-key-file must both be specified")
+	}
+
+	cert, err := tls.LoadX509KeyPair(cfg.tlsCertFile, cfg.tlsKeyFile)
+	if err != nil {
+		return nil, fmt.Errorf("load TLS key pair: %w", err)
+	}
+
+	tlsConfig := &tls.Config{
+		Certificates: []tls.Certificate{cert},
+		MinVersion:   tls.VersionTLS12,
+	}
+
+	if cfg.tlsClientCAFile != "" {
+		caPEM, err := os.ReadFile(cfg.tlsClientCAFile)
+		if err != nil {
+			return nil, fmt.Errorf("read client CA file %q: %w", cfg.tlsClientCAFile, err)
+		}
+		pool := x509.NewCertPool()
+		if !pool.AppendCertsFromPEM(caPEM) {
+			return nil, fmt.Errorf("no valid CA certificates found in %q", cfg.tlsClientCAFile)
+		}
+		tlsConfig.ClientCAs = pool
+		if cfg.requireClientCert {
+			tlsConfig.ClientAuth = tls.RequireAndVerifyClientCert
+		} else {
+			tlsConfig.ClientAuth = tls.VerifyClientCertIfGiven
+		}
+	} else if cfg.requireClientCert {
+		return nil, errors.New("--require-client-cert requires --tls-client-ca-file")
+	}
+
+	return tlsConfig, nil
+}
+
 func run(cfg *config, log logr.Logger) error {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
@@ -164,6 +229,14 @@ func run(cfg *config, log logr.Logger) error {
 	if cfg.grpcPort == cfg.restPort {
 		return fmt.Errorf("--grpc-port and --rest-port must differ (both %d)", cfg.grpcPort)
 	}
+	if cfg.healthPort > 0 {
+		if err := validatePort("health-port", cfg.healthPort); err != nil {
+			return err
+		}
+		if cfg.healthPort == cfg.grpcPort || cfg.healthPort == cfg.restPort {
+			return fmt.Errorf("--health-port must differ from --grpc-port and --rest-port")
+		}
+	}
 
 	// Create the sandbox root if missing so a template whose image lacks the
 	// directory still starts. MkdirAll errors if the path exists as a file.
@@ -174,6 +247,11 @@ func run(cfg *config, log logr.Logger) error {
 	authDigest, err := authTokenDigest(cfg)
 	if err != nil {
 		return err
+	}
+
+	tlsConfig, err := buildTLSConfig(cfg)
+	if err != nil {
+		return fmt.Errorf("configure TLS: %w", err)
 	}
 
 	srv, err := server.New(server.Options{
@@ -200,13 +278,46 @@ func run(cfg *config, log logr.Logger) error {
 		return fmt.Errorf("listen rest %q: %w", restAddr, err)
 	}
 
-	grpcServer := grpc.NewServer(srv.GRPCServerOptions()...)
+	var healthLis net.Listener
+	var healthAddr string
+	if cfg.healthPort > 0 {
+		healthAddr = net.JoinHostPort(cfg.listenHost, strconv.Itoa(cfg.healthPort))
+		healthLis, err = net.Listen("tcp", healthAddr)
+		if err != nil {
+			_ = grpcLis.Close()
+			_ = restLis.Close()
+			return fmt.Errorf("listen health %q: %w", healthAddr, err)
+		}
+	}
+
+	var grpcOpts []grpc.ServerOption
+	grpcOpts = append(grpcOpts, srv.GRPCServerOptions()...)
+	if tlsConfig != nil {
+		grpcOpts = append(grpcOpts, grpc.Creds(credentials.NewTLS(tlsConfig)))
+	}
+	grpcServer := grpc.NewServer(grpcOpts...)
 	srv.RegisterGRPC(grpcServer)
 	reflection.Register(grpcServer)
+
 	httpServer := &http.Server{
 		Handler:           srv.RESTHandler(),
 		ReadHeaderTimeout: readHeaderTimeout,
 		IdleTimeout:       cfg.httpIdleTimeout,
+	}
+	if tlsConfig != nil {
+		httpTLSConfig := tlsConfig.Clone()
+		httpTLSConfig.NextProtos = []string{"h2", "http/1.1"}
+		httpServer.TLSConfig = httpTLSConfig
+		restLis = tls.NewListener(restLis, httpTLSConfig)
+	}
+
+	var healthServer *http.Server
+	if healthLis != nil {
+		healthServer = &http.Server{
+			Handler:           srv.HealthHandler(),
+			ReadHeaderTimeout: readHeaderTimeout,
+			IdleTimeout:       cfg.httpIdleTimeout,
+		}
 	}
 
 	g, gctx := errgroup.WithContext(ctx)
@@ -222,6 +333,14 @@ func run(cfg *config, log logr.Logger) error {
 		}
 		return nil
 	})
+	if healthServer != nil {
+		g.Go(func() error {
+			if err := healthServer.Serve(healthLis); err != nil && !errors.Is(err, http.ErrServerClosed) {
+				return fmt.Errorf("health server: %w", err)
+			}
+			return nil
+		})
+	}
 	g.Go(func() error {
 		<-gctx.Done()
 		log.Info("shutting down")
@@ -236,6 +355,12 @@ func run(cfg *config, log logr.Logger) error {
 		// Shutdown is bounded by shutdownCtx; if it expires with connections
 		// still open, force-close them so shutdown-timeout is a hard bound,
 		// mirroring the gRPC GracefulStop/Stop fallback below.
+		if healthServer != nil {
+			if err := healthServer.Shutdown(shutdownCtx); err != nil {
+				log.Error(err, "health server graceful shutdown incomplete; forcing close")
+				_ = healthServer.Close()
+			}
+		}
 		if err := httpServer.Shutdown(shutdownCtx); err != nil {
 			log.Error(err, "rest server graceful shutdown incomplete; forcing close")
 			_ = httpServer.Close()
@@ -261,8 +386,11 @@ func run(cfg *config, log logr.Logger) error {
 		"sha", version.Get().GitSHA,
 		"grpc", grpcLis.Addr().String(),
 		"rest", restLis.Addr().String(),
+		"health", healthAddr,
 		"rootDir", cfg.rootDir,
 		"auth", authDigest != nil,
+		"tls", tlsConfig != nil,
+		"mTLS", cfg.requireClientCert,
 	)
 	return g.Wait()
 }

@@ -126,6 +126,11 @@ func (s *Server) RESTHandler() http.Handler {
 	return s.auth.middleware(s.restServer.Handler(), s.restServer)
 }
 
+// HealthHandler returns an unauthenticated http.Handler serving only GET /v1/health.
+func (s *Server) HealthHandler() http.Handler {
+	return s.restServer.HealthHandler()
+}
+
 // SetReady toggles the /v1/health readiness response.
 func (s *Server) SetReady(ready bool) {
 	s.restServer.SetReady(ready)

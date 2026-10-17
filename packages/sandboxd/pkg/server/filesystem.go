@@ -102,6 +102,13 @@ func (s *RESTServer) Handler() http.Handler {
 	return mux
 }
 
+// HealthHandler returns an http.Handler serving only GET /v1/health.
+func (s *RESTServer) HealthHandler() http.Handler {
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /v1/health", s.handleHealth)
+	return mux
+}
+
 func (s *RESTServer) writeJSON(w http.ResponseWriter, code int, body any) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(code)
