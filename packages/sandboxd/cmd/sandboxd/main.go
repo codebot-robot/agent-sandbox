@@ -23,12 +23,13 @@
 // The current sandbox-router cannot proxy the gRPC surface. Containment comes
 // from pod isolation and NetworkPolicy, not loopback binding; pass
 // --listen-host=127.0.0.1 to restrict to loopback for local development, and
-// --auth-token-sha256 (or --auth-token-file) to require a bearer token from
-// clients.
+// --auth-token-sha256 (or --auth-token-file / --auth-public-key / --auth-public-key-file)
+// to require client authentication.
 package main
 
 import (
 	"context"
+	"crypto/ed25519"
 	"errors"
 	"flag"
 	"fmt"
@@ -83,6 +84,9 @@ type config struct {
 	streamChunkSize   int
 	authTokenSHA256   string
 	authTokenFile     string
+	authPublicKey     string
+	authPublicKeyFile string
+	authAudience      string
 	printVersion      bool
 }
 
@@ -107,9 +111,15 @@ func main() {
 	flag.IntVar(&cfg.streamChunkSize, "stream-chunk-size", 0,
 		"Buffer size in bytes for streaming process stdout/stderr chunks. 0 selects the default (4096).")
 	flag.StringVar(&cfg.authTokenSHA256, "auth-token-sha256", "",
-		"Hex SHA-256 digest of a bearer token required on every gRPC call and REST request except GET /v1/health. The token itself never reaches the daemon. Mutually exclusive with --auth-token-file; both empty disables authentication.")
+		"Hex SHA-256 digest of a bearer token required on every gRPC call and REST request except GET /v1/health. The token itself never reaches the daemon. Mutually exclusive with --auth-token-file, --auth-public-key, and --auth-public-key-file; all empty disables authentication.")
 	flag.StringVar(&cfg.authTokenFile, "auth-token-file", "",
-		"File holding a bearer token (e.g. a mounted Secret), required like --auth-token-sha256. Mutually exclusive with it.")
+		"File holding a bearer token (e.g. a mounted Secret), required like --auth-token-sha256. Mutually exclusive with it and public key flags.")
+	flag.StringVar(&cfg.authPublicKey, "auth-public-key", "",
+		"Base64 raw 32-byte ed25519 public key used to verify signed bearer tokens required on every gRPC call and REST request except GET /v1/health. Mutually exclusive with --auth-public-key-file, --auth-token-sha256, and --auth-token-file.")
+	flag.StringVar(&cfg.authPublicKeyFile, "auth-public-key-file", "",
+		"File holding a base64 raw 32-byte ed25519 public key, required like --auth-public-key. Mutually exclusive with it and token flags.")
+	flag.StringVar(&cfg.authAudience, "auth-audience", "",
+		"Audience required in signed bearer tokens. Requires --auth-public-key or --auth-public-key-file.")
 	flag.BoolVar(&cfg.printVersion, "version", false, "Print version information and exit.")
 	zapOpts.BindFlags(flag.CommandLine)
 	flag.Parse()
@@ -137,18 +147,57 @@ func validatePort(name string, port int) error {
 	return nil
 }
 
-// authTokenDigest returns the configured bearer token's SHA-256 digest, or
-// nil when authentication is off.
-func authTokenDigest(cfg *config) ([]byte, error) {
-	switch {
-	case cfg.authTokenSHA256 != "" && cfg.authTokenFile != "":
-		return nil, errors.New("--auth-token-sha256 and --auth-token-file are mutually exclusive")
-	case cfg.authTokenSHA256 != "":
-		return server.ParseAuthTokenSHA256(cfg.authTokenSHA256)
-	case cfg.authTokenFile != "":
-		return server.LoadAuthTokenFile(cfg.authTokenFile)
+// authSettings validates flag mutual exclusivity and returns the configured authentication
+// settings: a static token digest or an asymmetric public key + audience, or nil when authentication is off.
+func authSettings(cfg *config) ([]byte, ed25519.PublicKey, string, error) {
+	var count int
+	if cfg.authTokenSHA256 != "" {
+		count++
 	}
-	return nil, nil
+	if cfg.authTokenFile != "" {
+		count++
+	}
+	if cfg.authPublicKey != "" {
+		count++
+	}
+	if cfg.authPublicKeyFile != "" {
+		count++
+	}
+	if count > 1 {
+		return nil, nil, "", errors.New("authentication flags are mutually exclusive: specify at most one of --auth-token-sha256, --auth-token-file, --auth-public-key, or --auth-public-key-file")
+	}
+	if cfg.authAudience != "" && cfg.authPublicKey == "" && cfg.authPublicKeyFile == "" {
+		return nil, nil, "", errors.New("--auth-audience requires --auth-public-key or --auth-public-key-file")
+	}
+
+	var digest []byte
+	var pubKey ed25519.PublicKey
+	var err error
+
+	switch {
+	case cfg.authTokenSHA256 != "":
+		digest, err = server.ParseAuthTokenSHA256(cfg.authTokenSHA256)
+		if err != nil {
+			return nil, nil, "", err
+		}
+	case cfg.authTokenFile != "":
+		digest, err = server.LoadAuthTokenFile(cfg.authTokenFile)
+		if err != nil {
+			return nil, nil, "", err
+		}
+	case cfg.authPublicKey != "":
+		pubKey, err = server.ParseAuthPublicKey(cfg.authPublicKey)
+		if err != nil {
+			return nil, nil, "", err
+		}
+	case cfg.authPublicKeyFile != "":
+		pubKey, err = server.LoadAuthPublicKeyFile(cfg.authPublicKeyFile)
+		if err != nil {
+			return nil, nil, "", err
+		}
+	}
+
+	return digest, pubKey, cfg.authAudience, nil
 }
 
 func run(cfg *config, log logr.Logger) error {
@@ -171,7 +220,7 @@ func run(cfg *config, log logr.Logger) error {
 		return fmt.Errorf("root dir %q: %w", cfg.rootDir, err)
 	}
 
-	authDigest, err := authTokenDigest(cfg)
+	authDigest, authPubKey, authAudience, err := authSettings(cfg)
 	if err != nil {
 		return err
 	}
@@ -181,6 +230,8 @@ func run(cfg *config, log logr.Logger) error {
 		MetadataEnvPrefix: cfg.metadataEnvPrefix,
 		StreamChunkSize:   cfg.streamChunkSize,
 		AuthTokenSHA256:   authDigest,
+		AuthPublicKey:     authPubKey,
+		AuthAudience:      authAudience,
 		Log:               log.WithName("rest"),
 	})
 	if err != nil {
@@ -266,7 +317,7 @@ func run(cfg *config, log logr.Logger) error {
 		"grpc", grpcLis.Addr().String(),
 		"rest", restLis.Addr().String(),
 		"rootDir", cfg.rootDir,
-		"auth", authDigest != nil,
+		"auth", authDigest != nil || authPubKey != nil,
 	)
 	return g.Wait()
 }

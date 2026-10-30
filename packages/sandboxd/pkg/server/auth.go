@@ -16,15 +16,19 @@ package server
 
 import (
 	"context"
+	"crypto/ed25519"
 	"crypto/sha256"
 	"crypto/subtle"
+	"encoding/base64"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
 	"os"
 	"slices"
 	"strings"
+	"time"
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
@@ -73,6 +77,54 @@ func LoadAuthTokenFile(path string) ([]byte, error) {
 	return digest[:], nil
 }
 
+// ParseAuthPublicKey decodes a base64 raw 32-byte ed25519 public key.
+func ParseAuthPublicKey(base64Key string) (ed25519.PublicKey, error) {
+	s := strings.TrimSpace(base64Key)
+	if s == "" {
+		return nil, errors.New("auth public key is empty")
+	}
+	b, err := base64.StdEncoding.DecodeString(s)
+	if err != nil {
+		b, err = base64.RawStdEncoding.DecodeString(s)
+	}
+	if err != nil {
+		b, err = base64.URLEncoding.DecodeString(s)
+	}
+	if err != nil {
+		b, err = base64.RawURLEncoding.DecodeString(s)
+	}
+	if err != nil {
+		return nil, fmt.Errorf("decode auth public key: %w", err)
+	}
+	if len(b) != ed25519.PublicKeySize {
+		return nil, fmt.Errorf("auth public key: want %d bytes, got %d", ed25519.PublicKeySize, len(b))
+	}
+	return ed25519.PublicKey(b), nil
+}
+
+// LoadAuthPublicKeyFile reads a base64 raw 32-byte ed25519 public key from path.
+// Surrounding whitespace is ignored; an empty file is an error.
+func LoadAuthPublicKeyFile(path string) (ed25519.PublicKey, error) {
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return nil, fmt.Errorf("read auth public key file: %w", err)
+	}
+	trimmed := strings.TrimSpace(string(raw))
+	if trimmed == "" {
+		return nil, errors.New("auth public key file is empty")
+	}
+	key, err := ParseAuthPublicKey(trimmed)
+	if err != nil && len(raw) == ed25519.PublicKeySize {
+		return ed25519.PublicKey(raw), nil
+	}
+	return key, err
+}
+
+// authChecker validates "Authorization: Bearer <token>" headers.
+type authChecker interface {
+	valid(header string) bool
+}
+
 // tokenChecker validates "Authorization: Bearer <token>" values against the
 // configured token's SHA-256 digest in constant time. Only the digest is
 // held, so the daemon never needs the token itself.
@@ -95,7 +147,82 @@ func (c *tokenChecker) valid(header string) bool {
 	return subtle.ConstantTimeCompare(got[:], c.want[:]) == 1
 }
 
-func (c *tokenChecker) authorizeGRPC(ctx context.Context) error {
+// signedTokenChecker verifies asymmetric ed25519-signed bearer tokens.
+type signedTokenChecker struct {
+	publicKey ed25519.PublicKey
+	audience  string
+	clock     func() time.Time
+}
+
+func newSignedTokenChecker(pubKey ed25519.PublicKey, audience string) *signedTokenChecker {
+	return &signedTokenChecker{
+		publicKey: pubKey,
+		audience:  audience,
+		clock:     time.Now,
+	}
+}
+
+func (c *signedTokenChecker) now() time.Time {
+	if c.clock != nil {
+		return c.clock()
+	}
+	return time.Now()
+}
+
+func decodeBase64URL(s string) ([]byte, error) {
+	b, err := base64.RawURLEncoding.DecodeString(s)
+	if err == nil {
+		return b, nil
+	}
+	return base64.URLEncoding.DecodeString(s)
+}
+
+func (c *signedTokenChecker) valid(header string) bool {
+	scheme, credential, ok := strings.Cut(header, " ")
+	if !ok || !strings.EqualFold(scheme, "Bearer") {
+		return false
+	}
+	token := strings.TrimSpace(credential)
+	parts := strings.Split(token, ".")
+	if len(parts) != 3 || parts[0] != "v1" {
+		return false
+	}
+
+	payloadBytes, err := decodeBase64URL(parts[1])
+	if err != nil {
+		return false
+	}
+	sigBytes, err := decodeBase64URL(parts[2])
+	if err != nil {
+		return false
+	}
+	if len(sigBytes) != ed25519.SignatureSize {
+		return false
+	}
+	if !ed25519.Verify(c.publicKey, payloadBytes, sigBytes) {
+		return false
+	}
+
+	var payload SignedTokenPayload
+	if err := json.Unmarshal(payloadBytes, &payload); err != nil {
+		return false
+	}
+
+	now := c.now().Unix()
+	if payload.Exp <= now {
+		return false
+	}
+	if payload.Iat > now+60 {
+		return false
+	}
+	if c.audience != "" && payload.Aud != c.audience {
+		return false
+	}
+
+	return true
+}
+
+func authorizeGRPC(ctx context.Context, c authChecker) error {
 	md, _ := metadata.FromIncomingContext(ctx)
 	if slices.ContainsFunc(md.Get("authorization"), c.valid) {
 		return nil
@@ -103,25 +230,26 @@ func (c *tokenChecker) authorizeGRPC(ctx context.Context) error {
 	return status.Error(codes.Unauthenticated, "missing or invalid bearer token")
 }
 
-func (c *tokenChecker) unaryInterceptor(ctx context.Context, req any, _ *grpc.UnaryServerInfo,
-	handler grpc.UnaryHandler) (any, error) {
-	if err := c.authorizeGRPC(ctx); err != nil {
-		return nil, err
+func unaryAuthInterceptor(c authChecker) grpc.UnaryServerInterceptor {
+	return func(ctx context.Context, req any, _ *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (any, error) {
+		if err := authorizeGRPC(ctx, c); err != nil {
+			return nil, err
+		}
+		return handler(ctx, req)
 	}
-	return handler(ctx, req)
 }
 
-func (c *tokenChecker) streamInterceptor(srv any, ss grpc.ServerStream, _ *grpc.StreamServerInfo,
-	handler grpc.StreamHandler) error {
-	if err := c.authorizeGRPC(ss.Context()); err != nil {
-		return err
+func streamAuthInterceptor(c authChecker) grpc.StreamServerInterceptor {
+	return func(srv any, ss grpc.ServerStream, _ *grpc.StreamServerInfo, handler grpc.StreamHandler) error {
+		if err := authorizeGRPC(ss.Context(), c); err != nil {
+			return err
+		}
+		return handler(srv, ss)
 	}
-	return handler(srv, ss)
 }
 
-// middleware rejects REST requests without the token, except the health
-// probe.
-func (c *tokenChecker) middleware(next http.Handler, s *RESTServer) http.Handler {
+// authMiddleware rejects REST requests without a valid token, except the health probe.
+func authMiddleware(c authChecker, next http.Handler, s *RESTServer) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != healthPath && !c.valid(r.Header.Get("Authorization")) {
 			w.Header().Set("WWW-Authenticate", `Bearer realm="sandboxd"`)

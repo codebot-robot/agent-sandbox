@@ -26,7 +26,8 @@ info:
     from environment variables. See KEP-539.2 for the endpoint and wire-format differences.
     Security note: sandboxd listens on the pod network by default. Protect both runtime ports with
     pod isolation and NetworkPolicy, or bind to loopback for local-only access. Never expose the
-    runtime API directly to an untrusted public network. When sandboxd runs with --auth-token-sha256 or --auth-token-file,
+    runtime API directly to an untrusted public network. When sandboxd runs with authentication
+    enabled (--auth-token-sha256, --auth-token-file, --auth-public-key, or --auth-public-key-file),
     every request except GET /v1/health must carry "Authorization: Bearer <token>"; otherwise it
     is refused with 401 UNAUTHENTICATED.
   version: "v1"
@@ -312,11 +313,11 @@ components:
     bearerAuth:
       type: http
       scheme: bearer
-      description: Required on every request except GET /v1/health when sandboxd runs with --auth-token-sha256 or --auth-token-file.
+      description: Required on every request except GET /v1/health when sandboxd runs with authentication enabled (--auth-token-sha256, --auth-token-file, --auth-public-key, or --auth-public-key-file).
 
   responses:
     Unauthorized:
-      description: Missing or invalid bearer token (only when sandboxd runs with --auth-token-sha256 or --auth-token-file)
+      description: Missing or invalid bearer token (only when sandboxd runs with authentication enabled)
       headers:
         WWW-Authenticate:
           schema:

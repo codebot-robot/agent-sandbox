@@ -241,8 +241,11 @@ Complete, runnable manifests for both (plus an end-to-end SDK client) live in
 | `--shutdown-timeout` | `10s` | Grace period for in-flight requests and child processes. |
 | `--http-idle-timeout` | `60s` | Close idle HTTP keep-alive connections after this duration. |
 | `--stream-chunk-size` | `4096` | Buffer size in bytes for streaming process stdout/stderr chunks. |
-| `--auth-token-sha256` | (none) | Hex SHA-256 digest of the bearer token clients must send. See [Client authentication](#client-authentication). |
-| `--auth-token-file` | (none) | File holding the bearer token (e.g. a mounted Secret). Alternative to `--auth-token-sha256`; set at most one. Neither leaves the API unauthenticated. |
+| `--auth-token-sha256` | (none) | Hex SHA-256 digest of the bearer token clients must send. Mutually exclusive with `--auth-token-file`, `--auth-public-key`, and `--auth-public-key-file`. See [Client authentication](#client-authentication). |
+| `--auth-token-file` | (none) | File holding the bearer token (e.g. a mounted Secret). Mutually exclusive with `--auth-token-sha256`, `--auth-public-key`, and `--auth-public-key-file`. |
+| `--auth-public-key` | (none) | Base64 raw 32-byte ed25519 public key used to verify signed bearer tokens. Mutually exclusive with public key file and token flags. See [Client authentication](#client-authentication). |
+| `--auth-public-key-file` | (none) | File holding a base64 raw 32-byte ed25519 public key. Alternative to `--auth-public-key`. |
+| `--auth-audience` | (none) | Audience string required in signed bearer tokens. Requires `--auth-public-key` or `--auth-public-key-file`. |
 | `--version` | | Print version info and exit. |
 
 ## Talking to sandboxd
@@ -422,7 +425,8 @@ The Python gRPC path requires the `grpc` extra: `pip install k8s-agent-sandbox[g
   for local development.
 - **Transport authentication:** `sandboxd` does not terminate TLS. By default
   it does not authenticate clients either; `--auth-token-sha256` (or
-  `--auth-token-file`) adds a bearer token check (see [Client authentication](#client-authentication)). Pod
+  `--auth-token-file`), or asymmetric ed25519 verification via `--auth-public-key`
+  (or `--auth-public-key-file`), adds a bearer token check (see [Client authentication](#client-authentication)). Pod
   port-forward access is authorized by the Kubernetes API server. Protect
   direct pod-network access with NetworkPolicy, a service mesh or mTLS proxy,
   or another trusted transport boundary, with or without the token.
@@ -438,6 +442,86 @@ The Python gRPC path requires the `grpc` extra: `pip install k8s-agent-sandbox[g
   shutdown SIGTERMs them, waits a grace period, then SIGKILLs stragglers.
 
 ## Client authentication
+
+`sandboxd` supports two mutually exclusive client authentication modes:
+static bearer tokens (verified against a SHA-256 digest) and asymmetric signed
+bearer tokens (verified against an ed25519 public key).
+
+### Asymmetric signed tokens (`--auth-public-key`)
+
+With `--auth-public-key=<base64>` (or `--auth-public-key-file=<path>`), `sandboxd`
+verifies ed25519-signed bearer tokens. Optionally, `--auth-audience=<string>` restricts
+acceptance to tokens minted for that specific sandbox.
+
+#### Why this shape
+
+Only the public key appears in the pod spec, so nothing in the sandbox or its manifest
+is secret. Expiry bounds replay of a captured token to minutes; with a static bearer token,
+a captured token works for the life of the sandbox. The audience stops a token signed for
+one sandbox from being replayed against another when a control plane uses one signing key
+for all its sandboxes.
+
+#### Token format
+
+Signed tokens use the following compact representation:
+
+```
+v1.<base64url(payload)>.<base64url(signature)>
+```
+
+where:
+- `payload` is JSON:
+  ```json
+  {"aud":"<string>","iat":<unix seconds>,"exp":<unix seconds>,"nonce":"<random string>"}
+  ```
+- `signature` is raw 64-byte `ed25519.Sign(privateKey, payload bytes)`.
+- `<base64url(...)>` encodes using URL-safe base64 (RFC 4648, unpadded or padded).
+
+The token travels identically to static tokens:
+- **gRPC:** metadata header `authorization: Bearer <token>`.
+- **REST:** HTTP header `Authorization: Bearer <token>`.
+
+#### Verification rules
+
+The daemon verifies:
+1. The ed25519 signature on the raw payload bytes against `--auth-public-key`.
+2. `exp` is in the future (`exp > now`).
+3. `iat` is not more than 60 seconds in the future (`iat <= now + 60s`, allowing for clock skew).
+4. `aud` matches `--auth-audience` when that flag is configured.
+
+Any token failing verification is rejected with `UNAUTHENTICATED` (`401` on REST,
+`codes.Unauthenticated` on gRPC). `GET /v1/health` stays open without a token.
+
+#### Minting tokens
+
+Clients in any language can mint tokens without specialized libraries:
+
+**Go:**
+```go
+import "sigs.k8s.io/agent-sandbox/packages/sandboxd/pkg/server"
+
+token, err := server.SignToken(privKey, "ns/my-sandbox", 5*time.Minute)
+```
+
+**Python:**
+```python
+import base64, json, os, time
+from cryptography.hazmat.primitives.asymmetric import ed25519
+
+now = int(time.time())
+payload = json.dumps({
+    "aud": "ns/my-sandbox",
+    "iat": now,
+    "exp": now + 300,
+    "nonce": os.urandom(16).hex(),
+}, separators=(",", ":")).encode("utf-8")
+
+sig = private_key.sign(payload)
+b64 = lambda b: base64.urlsafe_b64encode(b).decode("utf-8").rstrip("=")
+token = f"v1.{b64(payload)}.{b64(sig)}"
+```
+
+### Static bearer tokens (`--auth-token-sha256`)
 
 With `--auth-token-sha256=<hex>` sandboxd requires a bearer token whose SHA-256
 digest is `<hex>` on:
@@ -472,8 +556,8 @@ DIGEST=$(printf %s "$TOKEN" | sha256sum | cut -d' ' -f1)
 
 Where a token must reach the daemon itself, mount it from a Secret and pass
 `--auth-token-file=<path>` instead; whitespace around the token is ignored,
-and a missing or empty file is a startup error. Set at most one of the two
-flags.
+and a missing or empty file is a startup error. Set at most one authentication
+flag.
 
 The token authenticates the client that drives the sandbox. It is defense in
 depth beside NetworkPolicy, not a replacement for it: it covers traffic a

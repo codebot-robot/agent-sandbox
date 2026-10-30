@@ -20,6 +20,7 @@ package server
 
 import (
 	"context"
+	"crypto/ed25519"
 	"errors"
 	"fmt"
 	"net/http"
@@ -67,9 +68,15 @@ type Options struct {
 	// AuthTokenSHA256, when set, is the SHA-256 digest of a bearer token
 	// required as "Authorization: Bearer <token>" on every gRPC call and
 	// every REST request except GET /v1/health. Nil leaves the API
-	// unauthenticated.
+	// unauthenticated. Mutually exclusive with AuthPublicKey.
 	AuthTokenSHA256 []byte
-	Log             logr.Logger
+	// AuthPublicKey, when set, is the ed25519 public key used to verify
+	// signed bearer tokens. Mutually exclusive with AuthTokenSHA256.
+	AuthPublicKey ed25519.PublicKey
+	// AuthAudience, when set, is the required audience for signed tokens.
+	// Requires AuthPublicKey.
+	AuthAudience string
+	Log          logr.Logger
 }
 
 // Server bundles the gRPC ProcessService and FileWatcherService and the REST
@@ -80,7 +87,7 @@ type Server struct {
 	processServer *ProcessServer
 	watcherServer *FileWatcherServer
 	restServer    *RESTServer
-	auth          *tokenChecker
+	auth          authChecker
 }
 
 // New assembles a Server from opts.
@@ -88,6 +95,13 @@ func New(opts Options) (*Server, error) {
 	if opts.RootDir == "" {
 		return nil, errors.New("RootDir is required: refusing to default to \"/\", which would disable sandbox confinement")
 	}
+	if opts.AuthTokenSHA256 != nil && opts.AuthPublicKey != nil {
+		return nil, errors.New("AuthTokenSHA256 and AuthPublicKey are mutually exclusive")
+	}
+	if opts.AuthAudience != "" && opts.AuthPublicKey == nil {
+		return nil, errors.New("AuthAudience requires AuthPublicKey")
+	}
+
 	registry := processmanager.NewProcessRegistry()
 	s := &Server{
 		registry:      registry,
@@ -102,6 +116,13 @@ func New(opts Options) (*Server, error) {
 		}
 		s.auth = newTokenChecker(opts.AuthTokenSHA256)
 	}
+	if opts.AuthPublicKey != nil {
+		if len(opts.AuthPublicKey) != ed25519.PublicKeySize {
+			return nil, fmt.Errorf("AuthPublicKey must be %d bytes, got %d",
+				ed25519.PublicKeySize, len(opts.AuthPublicKey))
+		}
+		s.auth = newSignedTokenChecker(opts.AuthPublicKey, opts.AuthAudience)
+	}
 	return s, nil
 }
 
@@ -113,8 +134,8 @@ func (s *Server) GRPCServerOptions() []grpc.ServerOption {
 		return nil
 	}
 	return []grpc.ServerOption{
-		grpc.ChainUnaryInterceptor(s.auth.unaryInterceptor),
-		grpc.ChainStreamInterceptor(s.auth.streamInterceptor),
+		grpc.ChainUnaryInterceptor(unaryAuthInterceptor(s.auth)),
+		grpc.ChainStreamInterceptor(streamAuthInterceptor(s.auth)),
 	}
 }
 
@@ -129,7 +150,7 @@ func (s *Server) RESTHandler() http.Handler {
 	if s.auth == nil {
 		return s.restServer.Handler()
 	}
-	return s.auth.middleware(s.restServer.Handler(), s.restServer)
+	return authMiddleware(s.auth, s.restServer.Handler(), s.restServer)
 }
 
 // SetReady toggles the /v1/health readiness response.
